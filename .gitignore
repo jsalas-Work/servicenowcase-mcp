@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# NEVER distribute the debug Chrome profile. It is the user's own logged-in
+# Chrome profile (~350 MB) and contains "Login Data", "Login Data For Account"
+# and "Local State" — i.e. their live ServiceNow/Okta session and saved
+# credentials. Committing or zipping it would hand those to whoever receives
+# the copy. Each teammate's profile is created locally by
+# scripts/launch-debug-chrome.ps1 on first run; it is never shared.
+.chrome-debug-profile/
+
+# Local test targets. Case numbers and sys_ids are real customer
+# identifiers - keep them out of the repo.
+accept.cases.json
