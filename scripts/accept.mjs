@@ -270,10 +270,11 @@ try {
   const list = await rpc("tools/list", {});
   const tools = (list.result?.tools ?? []).map((t) => t.name).sort();
   console.log(`tools exposed (${tools.length}): ${tools.join(", ")}`);
-  // 7 until sn_launch_browser (2026-07-31), 9 since sn_status (2026-08-03).
+  // 7 until sn_launch_browser (2026-07-31), 9 since sn_status (2026-08-03),
+  // 10 since sn_case_bundle.
   // This assertion was left at 7 when tool 8 landed — keep it in step with
   // smoke-tools.mjs, or the exit gate silently stops matching the real surface.
-  check("surface is exactly 9 tools", tools.length === 9, `${tools.length} tools`);
+  check("surface is exactly 10 tools", tools.length === 10, `${tools.length} tools`);
 
   // sn_status must report the connection WITHOUT starting anything. The browser
   // is up by definition here (every case check below needs it), so the honest

@@ -50,7 +50,8 @@ $ALLOW_RULES = @(
   "mcp__servicenowcase__sn_read_panel",
   "mcp__servicenowcase__sn_open_record",
   "mcp__servicenowcase__sn_search",
-  "mcp__servicenowcase__sn_find_cases"
+  "mcp__servicenowcase__sn_find_cases",
+  "mcp__servicenowcase__sn_case_bundle"
 )
 
 # Read a JSON config, or an empty object if it does not exist yet. Fails loudly
@@ -238,7 +239,7 @@ Say "Done."
 Say ""
 Say "NEXT:"
 Say "  1. Restart Claude Code (MCP servers do not hot-load), or restart Claude Desktop."
-Say "  2. In Claude Code, run /mcp - it must show servicenowcase with 9 tools."
+Say "  2. In Claude Code, run /mcp - it must show servicenowcase with 10 tools."
 Say "     That is the ONLY proof it registered; npm run smoke passes either way."
 Say "  3. Say 'connect to ServiceNow' and complete Okta/SSO in the Chrome window."
 Say ""

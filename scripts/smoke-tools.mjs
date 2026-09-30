@@ -1,5 +1,5 @@
 // Gate check: spawn the built server over stdio, run the MCP handshake, call
-// tools/list, and assert the surface is EXACTLY the 9 approved tools — no more,
+// tools/list, and assert the surface is EXACTLY the 10 approved tools — no more,
 // no less. No browser needed for this test.
 //
 // Was 7 until 2026-07-31, when sn_launch_browser was added so Claude Desktop
@@ -10,6 +10,9 @@
 // ANSWERED without being ACTED ON — sn_launch_browser starts a browser when one
 // is absent, so it can never be a safe way to ask. sn_status starts nothing,
 // navigates nothing, and reads no ServiceNow data.
+//
+// Became 10 with sn_case_bundle, which adds no capability: it runs tools 3-7
+// in a fixed server-authored order so a whole case costs one call, not ~13.
 //
 // Any OTHER new tool appearing here is still a security failure — the point of
 // this gate is that the surface never grows silently.
@@ -30,6 +33,7 @@ const EXPECTED = [
   "sn_open_record",
   "sn_launch_browser",
   "sn_status",
+  "sn_case_bundle",
 ];
 
 const child = spawn(process.execPath, [serverPath], { stdio: ["pipe", "pipe", "inherit"] });
@@ -75,7 +79,7 @@ try {
   if (missing.length || extra.length) {
     if (missing.length) console.error("MISSING:", missing.join(", "));
     if (extra.length) console.error("UNEXPECTED (SECURITY FAIL):", extra.join(", "));
-    console.error("\nGATE FAILED — surface does not match the approved 9 tools.");
+    console.error("\nGATE FAILED — surface does not match the approved 10 tools.");
     child.kill();
     process.exit(1);
   }

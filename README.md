@@ -82,7 +82,7 @@ rather than starting a second one.
 
 ---
 
-## The 9 tools
+## The 10 tools
 
 | Tool | Access | Purpose |
 |------|--------|---------|
@@ -95,6 +95,21 @@ rather than starting a second one.
 | `sn_open_record(target)` | read | Open a record **listed in the current panel** (scoped, not a generic click) |
 | `sn_launch_browser()` | starts Chrome | **Connect.** Start the dedicated debug Chrome (or reopen its ServiceNow tab) so you can sign in. **No arguments** |
 | `sn_status()` | read (local port only) | Answer "are we connected?" — reports the state and **starts nothing** |
+| `sn_case_bundle(number)` | read | **The whole case in one call:** fields + activity stream, then the SLAs, Dispatch Orders, Emails (plain-text bodies) and Special handling notes panels incl. each note's body. Every section carries a STATUS (OK / EMPTY / UNREAD / NOT FOUND); stale or unloaded reads are retried automatically |
+
+### About `sn_case_bundle`
+
+Reading a case step by step (open, read, open panel, read panel ×4, open each SHI
+note, go back) takes about 13 tool calls, and every call re-sends the whole
+conversation to the model. `sn_case_bundle` does the same reads in one call, in a
+fixed server-authored order, with the re-read rules built in. **It adds no
+capability**: it only runs tools 3–7, and the only thing it types into is the search
+box, to open the case. It also trims what the model has to read: email HTML becomes
+plain text, automated "has been created / resolved / closed" mail keeps its subject
+and recipients but drops its body, and activity-stream copies of emails already shown
+in full in the Emails section are cut to their header. It takes 1–2 minutes and sends
+progress updates while it runs. Use it for QA reviews, escalation reports and any
+single-case analysis; the single-step tools remain for anything else.
 
 ### About `sn_status`
 
@@ -176,7 +191,7 @@ git clone https://github.com/jsalas-Work/servicenowcase-mcp.git
 cd servicenowcase-mcp
 npm install
 npm run build
-npm run smoke      # gate: must print "exactly 9 tools"
+npm run smoke      # gate: must print "exactly 10 tools"
 ```
 
 ### 2. Connect (sign in to ServiceNow)
@@ -306,12 +321,12 @@ claude mcp add servicenowcase --scope user \
 
 **Restart Claude Code** — MCP servers do not hot-load; a server registered mid-session
 will not appear until you restart. Then check with `/mcp` that `servicenowcase` is
-connected and lists 9 tools. **After the restart, launch debug Chrome (step 2)** — see the
+connected and lists 10 tools. **After the restart, launch debug Chrome (step 2)** — see the
 ordering warning there.
 
 Verifying registration matters: `npm run smoke` and `npm run accept` drive the server
 directly and **pass even when the server was never registered with Claude Code at all.**
-Neither one proves your host can see it. `/mcp` showing 9 tools is the only proof.
+Neither one proves your host can see it. `/mcp` showing 10 tools is the only proof.
 
 #### 3b. Claude Desktop app
 
@@ -403,7 +418,8 @@ Add to `~/.claude/settings.json` (merge with what's already there):
       "mcp__servicenowcase__sn_read_panel",
       "mcp__servicenowcase__sn_open_record",
       "mcp__servicenowcase__sn_search",
-      "mcp__servicenowcase__sn_find_cases"
+      "mcp__servicenowcase__sn_find_cases",
+      "mcp__servicenowcase__sn_case_bundle"
     ]
   }
 }
@@ -438,12 +454,32 @@ the first time each tool is used.
 ## Typical use
 
 ```
+sn_case_bundle CS1234567   → everything about the case, one call
+
+# or step by step:
 sn_open_case CS1234567     → opens it
 sn_read_case               → header + ~58 Details fields
 sn_open_panel "Special Handling Notes List"
 sn_read_panel              → the SHI notes, or "empty"
 sn_find_cases <array name> → sibling cases on the same asset
 ```
+
+---
+
+## Updating
+
+When this repo gets a new version (for example a new tool), each teammate runs:
+
+```powershell
+cd <your clone of servicenowcase-mcp>
+git pull
+.\scripts\install.ps1
+```
+
+Then **fully restart Claude** (Claude Code and Claude Desktop only load MCP servers
+at startup). `install.ps1` rebuilds, re-runs the tool-surface gate and adds any new
+read-only tool to the permission allow-list. Or just ask Claude: *"update the
+ServiceNowCase MCP from its GitHub repo"*.
 
 ---
 
@@ -463,7 +499,7 @@ step 3b.
 
 **Claude Code doesn't list the tools.**
 MCP servers do not hot-load — restart Claude Code. `npm run smoke` passing proves
-nothing about registration; only `/mcp` showing 9 tools does.
+nothing about registration; only `/mcp` showing 10 tools does.
 
 **"No case rows found" / empty search results.**
 Check whether the output includes the hidden-tab warning. ServiceNow does not
@@ -521,14 +557,14 @@ allow it.
 
 ```bash
 npm run build            # tsc
-npm run smoke            # surface gate: exactly 9 tools
+npm run smoke            # surface gate: exactly 10 tools
 npm run accept           # full gate: drives every tool over the real MCP protocol
 node scripts/live-test.mjs read                  # read the open case
 node scripts/live-test.mjs findcases "<query>"   # cross-case search
 node scripts/live-test.mjs opencase CS1234567    # search + open
 ```
 
-`npm run accept` is the exit gate: it drives all 9 tools against the cases you
+`npm run accept` is the exit gate: it drives all 10 tools against the cases you
 give it and prints a PASS/WARN/FAIL checklist. **No real case numbers are
 committed to this repo** — supply your own:
 

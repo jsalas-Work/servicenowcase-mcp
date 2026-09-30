@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * ServiceNowCase MCP — a read-only ServiceNow case reader with a LOCKED tool
- * surface. It exposes exactly nine tools and nothing else:
+ * surface. It exposes exactly ten tools and nothing else:
  *
  *   1. sn_search         — type into the global search box (THE ONLY ServiceNow WRITE)
  *   2. sn_find_cases     — cross-case search -> list
@@ -12,6 +12,7 @@
  *   7. sn_open_record    — open a record LISTED in the current panel (scoped)
  *   8. sn_launch_browser — connect: start the dedicated debug Chrome (no arguments)
  *   9. sn_status         — report the connection state, starting nothing
+ *  10. sn_case_bundle    — tools 3-7 run in a fixed order, as ONE call
  *
  * There is deliberately NO generic click, NO fill, NO evaluate/JS, NO network
  * or cookie inspection, and NO write of any kind beyond the search box. Safety
@@ -29,7 +30,11 @@
  * tool 8 acts when the browser is absent. sn_status starts nothing, opens
  * nothing, and reads no ServiceNow data — it only inspects the local debug port.
  *
- * All nine tools are implemented.
+ * Tool 10 adds no capability: it runs tools 3-7 in a fixed, server-authored
+ * order (with their re-read rules) so a whole case costs one round-trip instead
+ * of ~13. See bundle.ts.
+ *
+ * All ten tools are implemented.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -37,6 +42,7 @@ import { z } from "zod";
 import { CONFIG } from "./config.js";
 import { getServiceNowPage } from "./browser.js";
 import { launchDebugBrowser, connectionStatus } from "./launch.js";
+import { caseBundle } from "./bundle.js";
 import {
   readCase,
   openPanel,
@@ -222,6 +228,36 @@ server.registerTool(
     inputSchema: {},
   },
   async () => guard(async () => connectionStatus()),
+);
+
+// 10 — sn_case_bundle: the whole case in one call (composes tools 3-7).
+server.registerTool(
+  "sn_case_bundle",
+  {
+    title: "Read a whole case",
+    description:
+      "Open a case by number and return EVERYTHING about it in one call: header + Details fields + the full activity stream, then the SLAs, Dispatch Orders, Emails (bodies as plain text) and Special handling notes panels, including each SHI note's body. Every section carries a STATUS (OK / EMPTY / UNREAD / NOT FOUND) — UNREAD is never the same as empty. Re-reads stale or unloaded data automatically and ends back on the case. Takes 1-2 minutes. Prefer this over calling sn_open_case / sn_read_case / sn_open_panel / sn_read_panel / sn_open_record one by one. Read-only; the only thing it types into is the search box, to open the case.",
+    inputSchema: {
+      number: z
+        .string()
+        .regex(CONFIG.caseNumberPattern, "Must be a case number like CS1234567")
+        .describe("Case number, format CS#######"),
+    },
+  },
+  async ({ number }, extra) =>
+    guard(async () => {
+      const token = extra._meta?.progressToken;
+      return caseBundle(number, async (progress, total, message) => {
+        if (extra.signal.aborted) throw new Error("cancelled by the client");
+        if (token === undefined) return;
+        await extra
+          .sendNotification({
+            method: "notifications/progress",
+            params: { progressToken: token, progress, total, message },
+          })
+          .catch(() => {});
+      });
+    }),
 );
 
 const transport = new StdioServerTransport();

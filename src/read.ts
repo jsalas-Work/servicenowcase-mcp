@@ -1624,7 +1624,14 @@ function listItems(nodes: AXNode[]): PanelItem[] {
  * (columnheader + gridcell), NOT as links — reading only links reported an
  * SLA panel holding one row as "empty except page chrome".
  */
-function readGridRows(nodes: AXNode[]): string[] {
+/**
+ * Optional per-row rewrite, used only by sn_case_bundle (e.g. email HTML ->
+ * plain text). Runs in Node on text already read — it can't touch the page.
+ * The single-panel tools never pass it, so their output is unchanged.
+ */
+export type RowTransform = (cells: [label: string, value: string][]) => [string, string][];
+
+function readGridRows(nodes: AXNode[], transform?: RowTransform): string[] {
   const { byId, parentOf } = buildMaps(nodes);
   const grid = nodes.find((n) => ["grid", "table", "treegrid"].includes(rl(n)));
   if (!grid) return [];
@@ -1637,20 +1644,17 @@ function readGridRows(nodes: AXNode[]): string[] {
       (c) => ["gridcell", "cell"].includes(rl(c)) && hasAncestor(c, row.nodeId, parentOf),
     );
     if (!cells.length) continue; // the header row itself
-    const pairs = cells
-      .map((c, i) => {
-        const v = subtreeText(c.nodeId, byId);
-        const label = headers[i] || `col${i + 1}`;
-        return v ? `${label}: ${v}` : "";
-      })
-      .filter(Boolean);
-    if (pairs.length) out.push(pairs.join(" | "));
+    let pairs: [string, string][] = cells
+      .map((c, i): [string, string] => [headers[i] || `col${i + 1}`, subtreeText(c.nodeId, byId)])
+      .filter(([, v]) => Boolean(v));
+    if (transform) pairs = transform(pairs);
+    if (pairs.length) out.push(pairs.map(([label, v]) => `${label}: ${v}`).join(" | "));
   }
   return out;
 }
 
 /** Read the currently open panel: its records, or report empty. */
-export async function readPanel(page: Page): Promise<string> {
+export async function readPanel(page: Page, transform?: RowTransform): Promise<string> {
   const client = await openSession(page);
   try {
     const nodes = await fullTree(client);
@@ -1665,7 +1669,7 @@ export async function readPanel(page: Page): Promise<string> {
       /,\s*(\d+)\s*$/.exec(panelLabel)?.[1] ?? /\(\s*(\d+)\s*\)\s*$/.exec(panelLabel)?.[1];
     const declaredCount = declared != null ? Number(declared) : null;
 
-    const rows = readGridRows(nodes);
+    const rows = readGridRows(nodes, transform);
     const main = nodes.find((n) => rl(n) === "main");
     const listRows = nodes
       .filter((n) => rl(n) === "listitem" && (!main || hasAncestor(n, main.nodeId, parentOf)))
