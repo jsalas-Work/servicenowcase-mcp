@@ -193,12 +193,21 @@ export async function openCaseFromSearch(page: Page, caseNumber: string): Promis
  * benign "Close dialog" button ONLY. We NEVER touch "Dismiss note", because
  * dismissing acknowledges the note = a write. Returns captured text, or "".
  */
-export async function handleShiPopup(page: Page): Promise<string> {
+export async function handleShiPopup(page: Page, waitMs = 0): Promise<string> {
   const client = await openSession(page);
   try {
-    const nodes = await fullTree(client);
+    // The popup can mount a few seconds after the case opens; waitMs > 0 polls
+    // for it instead of taking one snapshot and leaving it open behind us.
+    const deadline = Date.now() + waitMs;
+    let nodes = await fullTree(client);
+    const findClose = (ns: AXNode[]) =>
+      ns.find((n) => rl(n) === "button" && nm(n).toLowerCase() === "close dialog");
+    while (!(nodes.some((n) => rl(n) === "dialog") && findClose(nodes)) && Date.now() < deadline) {
+      await sleep(700);
+      nodes = await fullTree(client);
+    }
     const dialog = nodes.find((n) => rl(n) === "dialog");
-    const closeBtn = nodes.find((n) => rl(n) === "button" && nm(n).toLowerCase() === "close dialog");
+    const closeBtn = findClose(nodes);
     if (!dialog || !closeBtn) return "";
     const note = nodes
       .filter((n) => rl(n) === "StaticText" && nm(n))
@@ -1923,6 +1932,14 @@ export async function typeInSearch(page: Page, text: string): Promise<void> {
       box = nodes.find((n) => rl(n) === "combobox" && isSearch(n)) ?? nodes.find(isSearch);
       if (box && box.backendDOMNodeId != null) break;
       box = undefined;
+      // An open SHI popup is modal: it scopes the a11y tree to itself, so the
+      // search box (and every other input) vanishes and this looked exactly
+      // like a lapsed session. Close it benignly ("Close dialog" only, never
+      // "Dismiss note") and look again.
+      if (nodes.some((n) => rl(n) === "dialog")) {
+        await handleShiPopup(page);
+        continue;
+      }
       await sleep(1200);
     }
     if (!box || box.backendDOMNodeId == null) {

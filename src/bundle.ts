@@ -297,7 +297,8 @@ export async function caseBundle(number: string, progress: Progress): Promise<st
       const p = await getServiceNowPage();
       if (/\/sub\/record\//.test(p.url())) {
         await openCaseByNumber(p, want);
-        await handleShiPopup(p);
+        // Wait for the popup: it mounts late, and left open it blocks the next search.
+        await handleShiPopup(p, 5000);
       }
     } catch {
       /* best effort — never mask the real result */
