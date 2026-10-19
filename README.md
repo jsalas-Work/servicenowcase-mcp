@@ -95,21 +95,40 @@ rather than starting a second one.
 | `sn_open_record(target)` | read | Open a record **listed in the current panel** (scoped, not a generic click) |
 | `sn_launch_browser()` | starts Chrome | **Connect.** Start the dedicated debug Chrome (or reopen its ServiceNow tab) so you can sign in. **No arguments** |
 | `sn_status()` | read (local port only) | Answer "are we connected?" — reports the state and **starts nothing** |
-| `sn_case_bundle(number)` | read | **The whole case in one call:** fields + activity stream, then the SLAs, Dispatch Orders, Emails (plain-text bodies) and Special handling notes panels incl. each note's body. Every section carries a STATUS (OK / EMPTY / UNREAD / NOT FOUND); stale or unloaded reads are retried automatically |
+| `sn_case_bundle(number, part?)` | read | **The whole case in one call:** fields + **every** activity post, then the SLAs, Dispatch Orders, Emails (**every** row, plain-text bodies) and Special handling notes panels incl. each note's body, compacted. Every section carries a STATUS (OK / EMPTY / UNREAD / NOT FOUND; `partial` = read but incomplete); stale or unloaded reads are retried automatically. A large case comes back in parts (`part=2`, …) |
 
 ### About `sn_case_bundle`
 
 Reading a case step by step (open, read, open panel, read panel ×4, open each SHI
 note, go back) takes about 13 tool calls, and every call re-sends the whole
 conversation to the model. `sn_case_bundle` does the same reads in one call, in a
-fixed server-authored order, with the re-read rules built in. **It adds no
-capability**: it only runs tools 3–7, and the only thing it types into is the search
-box, to open the case. It also trims what the model has to read: email HTML becomes
-plain text, automated "has been created / resolved / closed" mail keeps its subject
-and recipients but drops its body, and activity-stream copies of emails already shown
-in full in the Emails section are cut to their header. It takes 1–2 minutes and sends
-progress updates while it runs. Use it for QA reviews, escalation reports and any
-single-case analysis; the single-step tools remain for anything else.
+fixed server-authored order, with the re-read rules built in. **It adds no write
+capability**: the only thing it types into is the search box, to open the case.
+
+- **Complete.** It waits until the case has really rendered (and closes the Special
+  Handling pop-up with "Close dialog", never "Dismiss note"), then reads **every**
+  activity post — the stream renders only ~20 until it is scrolled, so the bundle
+  scrolls it — and **every** Emails / SLAs / Dispatch Orders row, paging with "Next
+  page" and putting the list back on page 1. If anything still could not be read,
+  the STATUS says so (`OK (partial: 50 of 121 activity posts read …)`, `UNREAD (…)`);
+  it never says OK for an incomplete read, and a panel that had not rendered is
+  UNREAD, never NOT FOUND.
+- **Compact.** Email HTML becomes plain text; automated "has been created / resolved /
+  closed" mail keeps its subject and recipients but drops its body; then
+  `src/compact.ts` shows repeated text once with a pointer (`[body: see Emails row 3]`)
+  and drops support footers, banners and disclaimers. `node scripts/compact-check.mjs`
+  checks its invariants offline on saved bundles.
+- **Never spills.** A bundle over 42,000 characters comes back in parts: part 1 ends
+  with `[PART 1 of N — call sn_case_bundle again with the same number and part=2 …]`.
+  Part 1 holds the case, SLAs, Dispatch Orders and SHI notes; part 2 the Emails. Only
+  when part 1 would still be too long do the oldest activity posts move on, after the
+  Emails (into part 3 if needed). Later parts come from an in-memory copy of that read
+  (15 minutes, same server process), or from a fresh read if there is none.
+- It ends back on the case (one step back in the tab's history from an SHI note),
+  and a footer times each step: `[bundle finished in 61s: open 7s, case 20s, …]`.
+
+Use it for QA reviews, escalation reports and any single-case analysis; the
+single-step tools remain for anything else, and their output is unchanged.
 
 ### About `sn_status`
 

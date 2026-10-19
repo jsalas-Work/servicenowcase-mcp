@@ -188,6 +188,22 @@ export async function openCaseFromSearch(page: Page, caseNumber: string): Promis
 }
 
 /**
+ * How many times handleShiPopup has clicked "Close dialog" in this server
+ * process. A read compares it before/after to learn that a popup landed
+ * mid-read (it cuts the a11y tree down to itself while open), which means
+ * that read may be incomplete and is worth repeating.
+ */
+let shiCloseCount = 0;
+let shiLastText = "";
+export function shiPopupCloses(): number {
+  return shiCloseCount;
+}
+/** The text of the last popup handleShiPopup captured and closed. */
+export function lastShiPopupText(): string {
+  return shiLastText;
+}
+
+/**
  * Opening a case pops a "Special Handling Note" modal that scopes the a11y
  * tree to itself. We CAPTURE its text (bonus SHI read) and close it with the
  * benign "Close dialog" button ONLY. We NEVER touch "Dismiss note", because
@@ -218,6 +234,8 @@ export async function handleShiPopup(page: Page, waitMs = 0): Promise<string> {
     if (closeBtn.backendDOMNodeId != null) {
       // SAFETY: only ever the benign close — never "Dismiss note".
       await clickBackend(client, closeBtn.backendDOMNodeId);
+      shiCloseCount++;
+      shiLastText = note;
       await sleep(500);
     }
     return note;
@@ -228,9 +246,15 @@ export async function handleShiPopup(page: Page, waitMs = 0): Promise<string> {
 
 /** One snapshot of currently-rendered field label -> value pairs. */
 async function snapshotFields(page: Page): Promise<Map<string, string>> {
+  return (await snapshotFieldsEx(page)).fields;
+}
+
+/** snapshotFields, plus whether a modal dialog was cutting the tree down. */
+async function snapshotFieldsEx(page: Page): Promise<{ fields: Map<string, string>; dialog: boolean }> {
   const client = await openSession(page);
   try {
     const nodes = await fullTree(client);
+    const dialog = nodes.some((n) => rl(n) === "dialog");
     const m = new Map<string, string>();
     for (const n of nodes) {
       const r = rl(n);
@@ -243,7 +267,7 @@ async function snapshotFields(page: Page): Promise<Map<string, string>> {
       // Keep first non-empty value we ever see for a label.
       if (!m.has(label) || (!m.get(label) && val)) m.set(label, val);
     }
-    return m;
+    return { fields: m, dialog };
   } finally {
     await client.detach().catch(() => {});
   }
@@ -440,40 +464,73 @@ const LIST_SHELLS = `
  * change that actually took effect (the OS caps this at the screen size).
  */
 async function ensureWindowSize(page: Page, minW = 1360, minH = 660): Promise<string> {
+  type Bounds = {
+    left?: number;
+    top?: number;
+    width?: number;
+    height?: number;
+    windowState?: "normal" | "minimized" | "maximized" | "fullscreen";
+  };
   const client = await page.createCDPSession();
+  // CDP errors are kept, not swallowed: when the window refuses to grow, the
+  // note below says why, instead of leaving a bare "will not allow it".
+  const errors: string[] = [];
   try {
-    const { windowId, bounds } = (await client.send("Browser.getWindowForTarget")) as unknown as {
-      windowId: number;
-      bounds: { width?: number; height?: number; windowState?: string };
+    const get = async () =>
+      (await client.send("Browser.getWindowForTarget")) as unknown as { windowId: number; bounds: Bounds };
+    const { windowId, bounds } = await get();
+    const set = async (b: Bounds) => {
+      try {
+        await client.send("Browser.setWindowBounds", { windowId, bounds: b });
+      } catch (e) {
+        errors.push(`setWindowBounds(${JSON.stringify(b)}): ${e instanceof Error ? e.message : String(e)}`);
+      }
     };
+    const fits = (b: Bounds) => (b.width ?? 0) >= minW && (b.height ?? 0) >= minH;
     const w = bounds.width ?? 0;
     const h = bounds.height ?? 0;
-    if (w >= minW && h >= minH) return "";
-    if (bounds.windowState && bounds.windowState !== "normal") {
-      await client
-        .send("Browser.setWindowBounds", { windowId, bounds: { windowState: "normal" } })
-        .catch(() => {});
+    const state = bounds.windowState ?? "normal";
+    if (fits(bounds)) return "";
+
+    // A minimized, maximized or fullscreen window ignores a size change, so
+    // restore it to "normal" first and re-read its size: restoring alone can
+    // already give it the room it needs.
+    let now = bounds;
+    if (state !== "normal") {
+      await set({ windowState: "normal" });
+      await sleep(400);
+      now = (await get()).bounds;
     }
-    await client
-      .send("Browser.setWindowBounds", {
-        windowId,
-        bounds: { width: Math.max(w, minW), height: Math.max(h, minH) },
-      })
-      .catch(() => {});
-    await sleep(1500);
-    const after = (await client.send("Browser.getWindowForTarget")) as unknown as {
-      bounds: { width?: number; height?: number };
-    };
-    const nw = after.bounds.width ?? w;
-    const nh = after.bounds.height ?? h;
-    if (nw === w && nh === h) {
+    if (!fits(now)) {
+      await set({ width: Math.max(now.width ?? 0, minW), height: Math.max(now.height ?? 0, minH) });
+      await sleep(800);
+      now = (await get()).bounds;
+    }
+    // A window snapped to a screen edge can refuse to grow where it is; move it
+    // to the top-left corner and ask once more.
+    if (!fits(now)) {
+      await set({ left: 0, top: 0, width: Math.max(now.width ?? 0, minW), height: Math.max(now.height ?? 0, minH) });
+      await sleep(800);
+      now = (await get()).bounds;
+    }
+    const nw = now.width ?? w;
+    const nh = now.height ?? h;
+    if (!fits(now)) {
+      // Never leave the window smaller than we found it: a maximized window on
+      // a small screen goes back to maximized.
+      if (state === "maximized" && nw * nh <= w * h) await set({ windowState: "maximized" });
       return (
-        `[note: browser window is ${w}x${h}, smaller than the ${minW}x${minH} the Details form ` +
-        `needs, and the screen will not allow it to grow. Some fields may not lay out.]`
+        `[note: browser window is ${nw}x${nh}${state !== "normal" ? ` (was ${state} at ${w}x${h})` : ""}, ` +
+        `smaller than the ${minW}x${minH} the Details form needs, and the screen will not allow it ` +
+        `to grow. Some fields may not lay out.` +
+        (errors.length ? ` Browser said: ${errors.join("; ").slice(0, 300)}` : "") +
+        `]`
       );
     }
-    return `[window enlarged ${w}x${h} -> ${nw}x${nh} so the Details form lays out]`;
+    return `[window enlarged ${w}x${h}${state !== "normal" ? ` (${state})` : ""} -> ${nw}x${nh} so the Details form lays out]`;
   } catch {
+    // The window could not even be inspected (e.g. a page-level connection
+    // without the Browser domain): say nothing, as before.
     return "";
   } finally {
     await client.detach().catch(() => {});
@@ -514,7 +571,7 @@ function onCaseRecordUrl(page: Page): boolean {
 }
 
 /** Select the "Details" tab if it exists and isn't already the active one. */
-async function ensureDetailsTab(page: Page): Promise<void> {
+export async function ensureDetailsTab(page: Page): Promise<void> {
   const client = await openSession(page);
   try {
     const nodes = await fullTree(client);
@@ -541,12 +598,23 @@ async function waitForForm(
   page: Page,
   expected: string | undefined,
   timeoutMs = 30000,
+  closeDialogs = false,
 ): Promise<{ ok: boolean; waitedMs: number; ax: Map<string, string>; why: string }> {
   const started = Date.now();
   let ax = new Map<string, string>();
   let why = "no form fields ever rendered";
+  let closes = 0;
   while (Date.now() - started < timeoutMs) {
-    ax = await snapshotFields(page);
+    const snap = await snapshotFieldsEx(page);
+    ax = snap.fields;
+    // Bundle only: a Special Handling popup that mounts now hides every field
+    // from the a11y tree, so waiting would only run out the clock. Close it
+    // (benign "Close dialog", never "Dismiss note") and look again.
+    if (closeDialogs && snap.dialog && closes < 3) {
+      closes++;
+      await handleShiPopup(page);
+      continue;
+    }
     const num = (ax.get("Number") ?? "").trim();
     const hasDepth = ax.has("Priority") || ax.has("Assigned to") || ax.has("Short description");
     if (num && hasDepth) {
@@ -657,15 +725,33 @@ async function readHeaderPairs(page: Page): Promise<Map<string, string>> {
  *   5. walk the form pane's scrollTop, harvesting controls as they materialise
  *   6. report any declared field whose control never rendered, rather than
  *      silently dropping it
+ *
+ * The options are used by sn_case_bundle only; sn_read_case passes none, so
+ * its output is unchanged.
  */
-export async function readCase(page: Page): Promise<string> {
+export type ReadCaseOptions = {
+  /**
+   * Load EVERY activity post, not just the ~20 the stream renders up front,
+   * and say whether the stream was read completely. Also turns on the dialog
+   * guards: a Special Handling popup that mounts mid-read is closed and the
+   * read is repeated once.
+   */
+  allActivity?: boolean;
+  /** Popup text the caller already captured and closed (shown as before). */
+  popup?: string;
+  /** internal: this is the single repeat after a popup landed mid-read */
+  repeat?: boolean;
+};
+
+export async function readCase(page: Page, opts: ReadCaseOptions = {}): Promise<string> {
   // A panel row opened in place is a different record with a different layout.
   // Handle it explicitly instead of failing the case-form gate and then
   // misblaming the open case tabs.
   const sub = subRecordInfo(page);
   if (sub) return readSubRecord(page, sub);
 
-  const popup = await handleShiPopup(page);
+  const bundle = !!opts.allActivity;
+  const popup = (await handleShiPopup(page)) || opts.popup || "";
   const resized = await ensureWindowSize(page);
   await ensureDetailsTab(page);
 
@@ -679,7 +765,9 @@ export async function readCase(page: Page): Promise<string> {
   const expected = tabCase ?? /\b(CS\d{6,})\b/.exec(title)?.[1];
   const expectedFrom = tabCase ? "workspace tab" : expected ? "page title" : "";
 
-  const ready = await waitForForm(page, expected);
+  const ready = await waitForForm(page, expected, 30000, bundle);
+  // From here on, a popup that lands hides the tree from the snapshots below.
+  const closesBefore = shiPopupCloses();
   const header = await readHeaderPairs(page);
 
   const fields = new Map<string, { label: string; value: string }>();
@@ -867,19 +955,30 @@ export async function readCase(page: Page): Promise<string> {
   }
 
   // Work notes / comments live here, not on the form.
-  const activity = await readActivity(page);
+  const activity = await readActivity(page, { all: bundle });
+
+  // Bundle only: a popup that mounted during the walk or the activity read hid
+  // the tree from some of the snapshots above. It fires once per render, so
+  // one repeat reads a clean page.
+  if (bundle && !opts.repeat && shiPopupCloses() > closesBefore) {
+    return readCase(page, { ...opts, popup: popup || lastShiPopupText(), repeat: true });
+  }
+
   if (activity.posts.length) {
     out.push("", `== Activity stream (${activity.posts.length} posts) ==`);
+    if (activity.completeness) out.push(activity.completeness);
     if (activity.warning) out.push(activity.warning);
     activity.posts.forEach((p, i) => out.push(`--- post ${i + 1} ---`, p));
   } else {
-    out.push(
-      "",
-      "== Activity stream ==",
-      activity.warning ||
+    out.push("", "== Activity stream ==");
+    if (activity.completeness) out.push(activity.completeness);
+    if (activity.warning) out.push(activity.warning);
+    else if (!activity.complete) {
+      out.push(
         "(No activity posts were read. Do NOT conclude the case has no work notes — " +
           "read again; the stream may not have rendered.)",
-    );
+      );
+    }
   }
 
   out.push(
@@ -1311,11 +1410,58 @@ function subtreeText(rootId: string, byId: Map<string, AXNode>): string {
  * DISCLOSURE click — it reveals existing text and writes nothing. (This
  * deliberately supersedes the earlier note to keep "Show more" expanders out of
  * the tool surface: correctness of the QA evidence needs the full text.)
+ *
+ * `all` (sn_case_bundle only) also loads the posts the stream has not rendered
+ * yet — see loadAllActivity — and reports whether the stream was read in full.
+ * Without it the output is exactly what sn_read_case has always returned.
  */
-async function readActivity(page: Page): Promise<{ posts: string[]; warning: string }> {
+export type ActivityRead = {
+  posts: string[];
+  /** "Show more" truncation, and (all mode) an incomplete stream */
+  warning: string;
+  /** all mode: "[activity stream: all N posts read]" when complete */
+  completeness: string;
+  complete: boolean;
+};
+
+const TOTAL_ACTIVITIES = /^(\d+) total activities\.?$/i;
+const TILE_NAME = /^Tile (\d+) of (\d+)\b/i;
+
+/** Leaf `article` tiles under `main`: the activity posts, in document order. */
+function leafArticles(nodes: AXNode[], parentOf: Map<string, string>): AXNode[] {
+  const main = nodes.find((n) => rl(n) === "main");
+  const articles = nodes.filter((n) => rl(n) === "article");
+  // Keep the LEAF tiles: an outer article that contains other articles would
+  // repeat all of their text as one blob.
+  const isContainer = (a: AXNode) =>
+    articles.some((other) => other !== a && hasAncestor(other, a.nodeId, parentOf));
+  return articles.filter(
+    (a) => !(main && !hasAncestor(a, main.nodeId, parentOf)) && !isContainer(a),
+  );
+}
+
+/** "N total activities." as the stream states it, or null. */
+function declaredActivities(nodes: AXNode[]): number | null {
+  const n = nodes.find((x) => rl(x) === "StaticText" && TOTAL_ACTIVITIES.test(nm(x)));
+  return n ? Number(TOTAL_ACTIVITIES.exec(nm(n))![1]) : null;
+}
+
+/** Close a modal dialog that cuts the tree down to itself, then re-snapshot. */
+async function treeWithoutDialog(page: Page, client: CDPSession, nodes: AXNode[]): Promise<AXNode[]> {
+  for (let i = 0; i < 3 && nodes.some((n) => rl(n) === "dialog"); i++) {
+    await handleShiPopup(page); // benign "Close dialog" only
+    await sleep(300);
+    nodes = await fullTree(client);
+  }
+  return nodes;
+}
+
+export async function readActivity(page: Page, opts: { all?: boolean } = {}): Promise<ActivityRead> {
+  const all = !!opts.all;
   const client = await openSession(page);
   try {
     let nodes = await fullTree(client);
+    if (all) nodes = await treeWithoutDialog(page, client, nodes);
     const expand = nodes.find(
       (n) =>
         rl(n) === "button" && /^expand all activity posts$/i.test(cleanLabel(nm(n)).trim()),
@@ -1325,38 +1471,515 @@ async function readActivity(page: Page): Promise<{ posts: string[]; warning: str
       await sleep(1400);
       nodes = await fullTree(client);
     }
+    // Tiles that render later inherit the expanded state.
+    const load = all ? await loadAllActivity(page) : null;
+    if (all) nodes = await treeWithoutDialog(page, client, await fullTree(client));
 
     const { byId, parentOf } = buildMaps(nodes);
-    const main = nodes.find((n) => rl(n) === "main");
-    const articles = nodes.filter((n) => rl(n) === "article");
-    // Keep the LEAF tiles: an outer article that contains other articles would
-    // repeat all of their text as one blob.
-    const isContainer = (a: AXNode) =>
-      articles.some((other) => other !== a && hasAncestor(other, a.nodeId, parentOf));
-
-    const posts: string[] = [];
-    const seen = new Set<string>();
-    for (const a of articles) {
-      if (main && !hasAncestor(a, main.nodeId, parentOf)) continue;
-      if (isContainer(a)) continue;
-      const t = subtreeText(a.nodeId, byId);
-      if (!t || t.length < 3 || seen.has(t)) continue;
-      seen.add(t);
-      posts.push(t);
-    }
+    const leaves = leafArticles(nodes, parentOf);
 
     const stillCollapsed = nodes.filter(
       (n) => rl(n) === "button" && /^show more$/i.test(cleanLabel(nm(n)).trim()),
     ).length;
-    const warning = stillCollapsed
+    const truncated = stillCollapsed
       ? `[${stillCollapsed} post(s) still show a "Show more" control, so their text may be ` +
         `TRUNCATED. Treat anything missing as unread, not absent.]`
       : "";
-    return { posts, warning };
+
+    if (!all) {
+      const posts: string[] = [];
+      const seen = new Set<string>();
+      for (const a of leaves) {
+        const t = subtreeText(a.nodeId, byId);
+        if (!t || t.length < 3 || seen.has(t)) continue;
+        seen.add(t);
+        posts.push(t);
+      }
+      return { posts, warning: truncated, completeness: "", complete: false };
+    }
+
+    // All mode. De-duplicate by the tile's own name ("Tile k of N - ..."), not
+    // by its text: two genuinely distinct posts can read identically (e.g. two
+    // "System Image" tiles in the same second), and text de-dupe dropped one.
+    const byTile = new Map<number, string>();
+    const untitled: string[] = [];
+    const seenText = new Set<string>();
+    let tileTotal: number | null = null;
+    for (const a of leaves) {
+      const t = subtreeText(a.nodeId, byId);
+      if (!t || t.length < 3) continue;
+      const m = TILE_NAME.exec(nm(a));
+      if (m) {
+        tileTotal = Math.max(tileTotal ?? 0, Number(m[2]));
+        if (!byTile.has(Number(m[1]))) byTile.set(Number(m[1]), t);
+      } else if (!seenText.has(t)) {
+        seenText.add(t);
+        untitled.push(t);
+      }
+    }
+    const posts = [...[...byTile].sort((x, y) => x[0] - y[0]).map(([, t]) => t), ...untitled];
+    const declared = declaredActivities(nodes) ?? load?.declared ?? null;
+    const total = declared ?? tileTotal;
+
+    let completeness = "";
+    let incomplete = "";
+    let complete = false;
+    if (total == null) {
+      incomplete =
+        `[warning: activity stream: ${posts.length} posts read, but the stream's total count ` +
+        `was not found — anything missing is unread, not absent.]`;
+    } else {
+      let read = 0;
+      for (let k = 1; k <= total; k++) if (byTile.has(k)) read++;
+      if (!byTile.size) read = Math.min(posts.length, total);
+      complete = read === total && (tileTotal == null || tileTotal === total);
+      if (complete) {
+        completeness = total === 0
+          ? "[activity stream: the case has 0 activities]"
+          : `[activity stream: all ${total} posts read]`;
+      } else {
+        const why = load && !load.ok && load.reason ? ` (${load.reason})` : "";
+        incomplete =
+          `[warning: activity stream: ${read} of ${total} posts rendered — the rest are ` +
+          `unread, not absent.${why}]`;
+      }
+    }
+    return {
+      posts,
+      warning: [incomplete, truncated].filter(Boolean).join("\n"),
+      completeness,
+      complete,
+    };
   } catch {
-    return { posts: [], warning: "[activity stream could not be read — treat as unread.]" };
+    return {
+      posts: [],
+      warning: "[activity stream could not be read — treat as unread.]",
+      completeness: "",
+      complete: false,
+    };
   } finally {
     await client.detach().catch(() => {});
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Loading the whole activity stream (sn_case_bundle only).
+ *
+ * Measured live (2026-10-01): the record's data payload carries EVERY activity
+ * up front, and the stream builds one placeholder tile per activity
+ * (email-tile / journal-tile / audit-tile / attachment-tile, children of
+ * div.activities-container inside now-activity-stream-connected's shadow
+ * root), but renders only the first ~20. A placeholder (~42px, no <article>)
+ * renders once it intersects the scroll pane's viewport, and stays rendered
+ * when scrolled away. There is no "Load more" control and no paging.
+ *
+ * So: scroll the first unrendered placeholder to the TOP of the pane (that
+ * renders every placeholder in the viewport, ~22 per step), wait for the count
+ * to grow, repeat. CS1338491: 20 -> 121 posts in 5 steps / 2.8 s.
+ *
+ * The only DOM mutation is the pane's scrollTop (view state, put back to 0
+ * at the end), like readCase's form walk. The expressions are fixed and
+ * server-authored. Never used: "Sort activity by oldest to newest" (a stored
+ * user preference), the activity filters, or the layout switchers.
+ * ------------------------------------------------------------------ */
+type ActState = {
+  error?: string;
+  declared: number | null;
+  tiles: number;
+  rendered: number;
+  firstUnrendered: number;
+  scroller: boolean;
+  scTop: number;
+  fuTop: number | null;
+};
+
+const ACT_STATE = `
+  let stream = window.__snActStream;
+  if(!(stream && stream.isConnected && isVisible(stream))){
+    stream = null;
+    deepWalk(el => {
+      if(!stream && el.tagName.toLowerCase() === 'now-activity-stream-connected' && isVisible(el)) stream = el;
+    });
+    window.__snActStream = stream;
+  }
+  if(!stream) return { error: 'no visible activity stream on the page (the Details tab may not be selected, or the record layout was changed)' };
+  const root = stream.shadowRoot || stream;
+  const tiles = [];
+  let declared = null;
+  deepWalk(x => {
+    if(x.classList && x.classList.contains('activities-container')){
+      for(const k of x.children){ if(/-tile$/.test(k.tagName.toLowerCase())) tiles.push(k); }
+    }
+    if(declared == null && x.children.length === 0){
+      const m = /^(\\d+) total activities\\.?$/i.exec((x.textContent || '').trim());
+      if(m) declared = Number(m[1]);
+    }
+  }, root);
+  let rendered = 0, firstUnrendered = -1;
+  for(let i = 0; i < tiles.length; i++){
+    let a = null;
+    try { a = (tiles[i].shadowRoot || tiles[i]).querySelector('article'); } catch(_) {}
+    if(a) rendered++; else if(firstUnrendered < 0) firstUnrendered = i;
+  }
+  let sc = stream;
+  while(sc){
+    let cs = null;
+    try { cs = getComputedStyle(sc); } catch(_) {}
+    if(cs && /(auto|scroll)/.test(cs.overflowY) && sc.scrollHeight > sc.clientHeight + 30) break;
+    sc = sc.parentElement || (sc.getRootNode && sc.getRootNode().host) || null;
+  }
+  window.__snActScroller = sc || null;
+  const out = { declared: declared, tiles: tiles.length, rendered: rendered,
+                firstUnrendered: firstUnrendered, scroller: !!sc, scTop: 0, fuTop: null };
+  if(sc){
+    out.scTop = Math.round(sc.getBoundingClientRect().top);
+    if(firstUnrendered >= 0) out.fuTop = Math.round(tiles[firstUnrendered].getBoundingClientRect().top);
+  }
+  return out;
+`;
+
+type ActivityLoad = {
+  ok: boolean;
+  declared: number | null;
+  tiles: number;
+  rendered: number;
+  steps: number;
+  ms: number;
+  reason: string;
+};
+
+async function loadAllActivity(
+  page: Page,
+  { maxMs = 60000, maxSteps = 80, growMs = 3000, stallSteps = 3 } = {},
+): Promise<ActivityLoad> {
+  const t0 = Date.now();
+  const state = () => evalRead<ActState>(page, ACT_STATE);
+  const result = (s: ActState | null, steps: number, reason: string): ActivityLoad => ({
+    ok: !reason,
+    declared: s?.declared ?? null,
+    tiles: s?.tiles ?? 0,
+    rendered: s?.rendered ?? 0,
+    steps,
+    ms: Date.now() - t0,
+    reason,
+  });
+  const done = (x: ActState) => x.rendered >= x.tiles && (x.declared == null || x.tiles >= x.declared);
+
+  let s = await state();
+  if (!s || s.error) return result(null, 0, s?.error ?? "the activity stream could not be inspected");
+  let steps = 0;
+  let stuck = 0;
+  let reason = "";
+  try {
+    while (!done(s)) {
+      if (steps >= maxSteps || Date.now() - t0 > maxMs) {
+        reason = `stopped after ${steps} scroll steps / ${Math.round((Date.now() - t0) / 1000)}s`;
+        break;
+      }
+      if (!s.scroller) {
+        reason = "no scroll pane above the activity stream";
+        break;
+      }
+      steps++;
+      const before = s.rendered;
+      const beforeTiles = s.tiles;
+      if (s.firstUnrendered >= 0 && s.fuTop != null) {
+        // First placeholder to the top of the pane's viewport.
+        const delta = Math.round(s.fuTop - s.scTop - 2);
+        await evalRead(page, `const sc = window.__snActScroller; if(sc) sc.scrollTop = sc.scrollTop + (${delta}); return true;`);
+      } else {
+        // Every placeholder rendered but fewer than declared: try the very
+        // bottom (a server-paged stream; not observed on this instance).
+        await evalRead(page, `const sc = window.__snActScroller; if(sc) sc.scrollTop = sc.scrollHeight; return true;`);
+      }
+      // Wait for the count to grow (polls of 150 ms, up to growMs) ...
+      let next: ActState | null = s;
+      const until = Date.now() + growMs;
+      do {
+        await sleep(150);
+        next = await state();
+      } while (next && !next.error && next.rendered === before && next.tiles === beforeTiles && Date.now() < until);
+      // ... then let the batch finish: two equal polls (up to ~900 ms).
+      if (next && !next.error && (next.rendered !== before || next.tiles !== beforeTiles)) {
+        let last = next.rendered;
+        for (let k = 0; k < 6; k++) {
+          await sleep(150);
+          const x = await state();
+          next = x;
+          if (!x || x.error || x.rendered === last) break;
+          last = x.rendered;
+        }
+      }
+      if (!next || next.error) {
+        reason = next?.error ?? "the activity stream disappeared while loading";
+        break;
+      }
+      if (next.rendered === before && next.tiles === beforeTiles) {
+        if (++stuck >= stallSteps) {
+          s = next;
+          reason = `no new posts rendered after ${stallSteps} scroll steps`;
+          break;
+        }
+      } else {
+        stuck = 0;
+      }
+      s = next;
+    }
+  } finally {
+    // Leave the pane at the top, where a reader expects it.
+    await evalRead(page, `const sc = window.__snActScroller; if(sc) sc.scrollTop = 0; return true;`);
+  }
+  if (!reason && !done(s)) reason = `${s.rendered} of ${s.declared ?? s.tiles} posts rendered`;
+  return result(s, steps, reason);
+}
+
+/* ------------------------------------------------------------------ *
+ * "Has the case finished rendering?" (sn_case_bundle only)
+ *
+ * Measured live (2026-10-01): a fresh open returns from the search while the
+ * record is still rendering, and on the FIRST render of a case with Special
+ * Handling notes the SHI popup mounts 0-3.7 s later — up to 3.5 s after the
+ * page already looks ready. While it is open the a11y tree is cut down to the
+ * dialog: 0 panel tabs, 0 posts, no search box. A read that overlaps it gets
+ * "0 activity posts" and every panel "not found" with an empty tab list,
+ * which is exactly how a baseline first read failed.
+ *
+ * READY = the selected workspace tab is the expected case, the record's panel
+ * strip is rendered, the stream shows "N total activities." with at least one
+ * post (or N = 0), and no dialog is open — on two samples in a row, 300 ms
+ * apart. A dialog is closed with the benign "Close dialog" (never "Dismiss
+ * note"). On a first render of a case whose strip shows "Special Handling
+ * Notes List, N" (N > 0), READY is held up to 6 s for the popup to arrive.
+ * "First render" = not marked in window.__snCaseSeen, a page-scoped variable
+ * a reload wipes, which matches the popup's own lifecycle. A case without SHI
+ * notes, or one already rendered in this page, is never held.
+ * ------------------------------------------------------------------ */
+export type CaseReady = {
+  ok: boolean;
+  ms: number;
+  /** popup text captured while waiting ("" if none) */
+  popup: string;
+  /** dialogs closed while waiting */
+  closes: number;
+  /** READY was held for an SHI popup */
+  held: boolean;
+  /** what was missing, when not ok */
+  why: string;
+};
+
+type ReadySample = {
+  ready: boolean;
+  dialog: boolean;
+  selectedCase?: string;
+  strip: boolean;
+  onDetails: boolean;
+  details?: AXNode;
+  declared: number | null;
+  posts: number;
+  shiCount: number;
+};
+
+function readinessSample(nodes: AXNode[], want: string, requireActivity: boolean): ReadySample {
+  const { parentOf } = buildMaps(nodes);
+  const dialog = nodes.some((n) => rl(n) === "dialog");
+  const sel = nodes.find(
+    (n) => rl(n) === "tab" && /^CS\d{6,}$/i.test(cleanLabel(nm(n)).trim()) && prop(n, "selected") === true,
+  );
+  const selectedCase = sel ? cleanLabel(nm(sel)).trim().toUpperCase() : undefined;
+  const strip = recordStrip(nodes, parentOf);
+  const details = strip?.tabs.find((t) => cleanLabel(nm(t)).trim().toLowerCase() === "details");
+  const onDetails = !!details && prop(details, "selected") === true;
+  const declared = declaredActivities(nodes);
+  const posts = leafArticles(nodes, parentOf).length;
+  const shiLabel = strip?.tabs.map((t) => nm(t)).find((t) => /special handling/i.test(t)) ?? "";
+  const shiCount = Number(/,\s*(\d+)\s*$/.exec(shiLabel)?.[1] ?? /\(\s*(\d+)\s*\)\s*$/.exec(shiLabel)?.[1] ?? 0);
+  const activityOk = !requireActivity || (declared != null && (declared === 0 || posts > 0));
+  return {
+    ready: !dialog && selectedCase === want && !!strip && activityOk,
+    dialog,
+    selectedCase,
+    strip: !!strip,
+    onDetails,
+    details,
+    declared,
+    posts,
+    shiCount,
+  };
+}
+
+function notReadyWhy(s: ReadySample, want: string, requireActivity: boolean): string {
+  if (s.dialog) return "a dialog is open";
+  if (s.selectedCase !== want) return `the selected workspace tab is ${s.selectedCase ?? "not a case"}, not ${want}`;
+  if (!s.strip) return "the record's panel strip has not rendered";
+  if (requireActivity && s.declared == null) return "the activity stream has not rendered";
+  if (requireActivity && !s.posts) return `the stream says ${s.declared} activities but no post has rendered`;
+  return "not ready";
+}
+
+/** Was this case's record page already rendered (and so its popup handled) in this page? */
+export async function caseSeenInPage(page: Page, caseNumber: string): Promise<boolean> {
+  const key = JSON.stringify(caseNumber.trim().toUpperCase());
+  return (
+    (await evalRead<boolean>(page, `return !!(window.__snCaseSeen && window.__snCaseSeen[${key}]);`)) === true
+  );
+}
+
+async function markCaseSeen(page: Page, caseNumber: string): Promise<void> {
+  const key = JSON.stringify(caseNumber.trim().toUpperCase());
+  await evalRead(
+    page,
+    `window.__snCaseSeen = window.__snCaseSeen || {}; window.__snCaseSeen[${key}] = Date.now(); return true;`,
+  );
+}
+
+export async function waitCaseReady(
+  page: Page,
+  caseNumber: string,
+  {
+    firstRender = false,
+    timeoutMs = 30000,
+    shiWaitMs = 6000,
+    requireActivity = true,
+  }: { firstRender?: boolean; timeoutMs?: number; shiWaitMs?: number; requireActivity?: boolean } = {},
+): Promise<CaseReady> {
+  const want = caseNumber.trim().toUpperCase();
+  const t0 = Date.now();
+  let popup = "";
+  let closes = 0;
+  let streak = 0;
+  let held = false;
+  let firstReadyAt: number | null = null;
+  let detailsClicks = 0;
+  let why = "never sampled";
+  const client = await openSession(page);
+  try {
+    while (Date.now() - t0 < timeoutMs) {
+      const s = readinessSample(await fullTree(client), want, requireActivity);
+      if (s.dialog) {
+        if (closes >= 3) {
+          why = "a dialog stayed open after 3 benign closes";
+          break;
+        }
+        closes++;
+        popup = (await handleShiPopup(page)) || popup; // benign "Close dialog" only
+        streak = 0;
+        await sleep(300);
+        continue;
+      }
+      // The activity stream exists only on the Details panel tab.
+      if (
+        requireActivity &&
+        s.strip &&
+        s.selectedCase === want &&
+        !s.onDetails &&
+        s.details?.backendDOMNodeId != null &&
+        detailsClicks < 2
+      ) {
+        detailsClicks++;
+        await clickBackend(client, s.details.backendDOMNodeId);
+        streak = 0;
+        await sleep(600);
+        continue;
+      }
+      if (s.ready) {
+        if (firstReadyAt == null) firstReadyAt = Date.now();
+        const hold = firstRender && s.shiCount > 0 && closes === 0 && Date.now() - firstReadyAt < shiWaitMs;
+        if (hold) {
+          held = true;
+          streak = 0;
+        } else if (++streak >= 2) {
+          await markCaseSeen(page, want);
+          return { ok: true, ms: Date.now() - t0, popup, closes, held, why: "" };
+        }
+      } else {
+        streak = 0;
+        why = notReadyWhy(s, want, requireActivity);
+      }
+      await sleep(300);
+    }
+    return { ok: false, ms: Date.now() - t0, popup, closes, held, why };
+  } finally {
+    await client.detach().catch(() => {});
+  }
+}
+
+/**
+ * Watch for the request that precedes the SHI popup: the record's
+ * get_special_handling_notes data-broker call (~1 s before the modal mounts).
+ * Passive — it only listens to requests the page makes on its own.
+ */
+function watchShiNotesFetch(page: Page): { seenAt: () => number | null; stop: () => void } {
+  let seenAt: number | null = null;
+  const on = (r: { url(): string; postData(): string | undefined }) => {
+    try {
+      if (seenAt != null || !/\/api\/now\/uxf\/databroker\/exec/.test(r.url())) return;
+      if (/get_special_handling_notes/.test(r.postData() ?? "")) seenAt = Date.now();
+    } catch {
+      /* ignore */
+    }
+  };
+  page.on("request", on);
+  return { seenAt: () => seenAt, stop: () => void page.off("request", on) };
+}
+
+/**
+ * Leave a sub-record (an SHI note opened in place) and go back to its case,
+ * the way the browser's Back button would: one step back in the tab's own
+ * history, taken ONLY when that entry is this same case's record page on the
+ * ServiceNow host. ~1-2 s, against ~11 s for re-opening the case by search.
+ *
+ * Returns ok:false (and does nothing) when the previous entry is anything
+ * else; the caller then falls back to the search.
+ */
+export async function backToCase(
+  page: Page,
+  caseNumber: string,
+): Promise<{ ok: boolean; how: string; ms: number; popup: string }> {
+  const t0 = Date.now();
+  const res = (ok: boolean, how: string, popup = "") => ({ ok, how, ms: Date.now() - t0, popup });
+  if (!subRecordInfo(page)) return res(true, "already on the case");
+  const caseUrl = /^(https:\/\/[^/]+\/.*?\/record\/ps_customerservice_ts_case\/[0-9a-f]{32})/i.exec(
+    page.url(),
+  )?.[1];
+  if (!caseUrl) return res(false, "the sub-record is not inside a case record");
+  const watch = watchShiNotesFetch(page);
+  try {
+    const client = await page.createCDPSession();
+    try {
+      const h = (await client.send("Page.getNavigationHistory")) as unknown as {
+        currentIndex: number;
+        entries: { id: number; url: string }[];
+      };
+      const prev = h.entries[h.currentIndex - 1];
+      if (
+        !prev ||
+        !isAllowedUrl(prev.url) ||
+        /\/sub\/record\//.test(prev.url) ||
+        !prev.url.startsWith(caseUrl)
+      ) {
+        return res(false, "the previous page in the tab's history is not this case");
+      }
+      await client.send("Page.navigateToHistoryEntry", { entryId: prev.id });
+    } finally {
+      await client.detach().catch(() => {});
+    }
+    const until = Date.now() + 8000;
+    while (subRecordInfo(page) && Date.now() < until) await sleep(150);
+    if (subRecordInfo(page)) return res(false, "history back did not leave the sub-record within 8s");
+    // A reload would have wiped the page marker; then this is a first render.
+    const firstRender = !(await caseSeenInPage(page, caseNumber));
+    const r = await waitCaseReady(page, caseNumber, { requireActivity: false, firstRender, timeoutMs: 20000 });
+    if (!r.ok) return res(false, `back on the case, but it did not settle: ${r.why}`, r.popup);
+    // If the record re-ran its SHI fetch, its popup follows ~1 s later: wait
+    // for it (bounded) so it is not left open over the page.
+    let popup = r.popup;
+    const at = watch.seenAt();
+    if (!r.closes && at != null) {
+      popup = (await handleShiPopup(page, Math.max(0, at + 5000 - Date.now()))) || popup;
+    }
+    return res(true, "history back", popup);
+  } finally {
+    watch.stop();
   }
 }
 
@@ -1662,11 +2285,259 @@ function readGridRows(nodes: AXNode[], transform?: RowTransform): string[] {
   return out;
 }
 
+/**
+ * sn_case_bundle only — sn_read_panel passes none of these, so its output is
+ * unchanged (the backlog-audit skill parses its rows).
+ */
+export type ReadPanelOptions = {
+  /**
+   * Read EVERY page of a paged related list: "Next page" until the footer's
+   * "Showing A-B of N" reaches N, then "First page" to put the list back.
+   * Rows are numbered 1..N across pages.
+   */
+  allPages?: boolean;
+  /**
+   * The tab name openPanel just reported. The read then refuses — with an
+   * explicit "NOT an empty panel" marker — when a dialog or a half-rendered
+   * page means that panel is not the one on screen, instead of reporting
+   * whatever (or nothing) is there as the panel's rows.
+   */
+  expect?: string;
+};
+
+/** "Emails, 31" / "Special Handling Notes List  (1)" -> "emails" / "special handling notes list". */
+function normTab(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/,\s*\d+\s*$/, "")
+    .replace(/\s*\(\s*\d+\s*\)\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** The record's panel strip (the tablist holding "Details"), or null if it is not rendered. */
+function recordStrip(nodes: AXNode[], parentOf: Map<string, string>): { tabs: AXNode[]; selected?: AXNode } | null {
+  const allTabs = nodes.filter((n) => rl(n) === "tab" && nm(n));
+  for (const tl of nodes.filter((n) => rl(n) === "tablist")) {
+    const tabs = allTabs.filter((t) => hasAncestor(t, tl.nodeId, parentOf));
+    if (tabs.some((t) => cleanLabel(nm(t)).trim().toLowerCase() === "details")) {
+      return { tabs, selected: tabs.find((t) => prop(t, "selected") === true) };
+    }
+  }
+  return null;
+}
+
+/**
+ * Bundle guard for readPanel: wait (briefly) until the panel the caller opened
+ * is the selected one in the record's strip, closing a popup if one covers it.
+ */
+async function guardPanel(
+  page: Page,
+  client: CDPSession,
+  nodes: AXNode[],
+  expect: string,
+): Promise<{ nodes: AXNode[]; refusal?: string }> {
+  const want = normTab(expect);
+  const matches = (sel: string) =>
+    sel === want || (sel.length >= 4 && (sel.startsWith(want) || want.startsWith(sel)));
+  const deadline = Date.now() + 4000;
+  for (;;) {
+    nodes = await treeWithoutDialog(page, client, nodes);
+    const strip = recordStrip(nodes, buildMaps(nodes).parentOf);
+    const sel = strip?.selected ? normTab(cleanLabel(nm(strip.selected))) : "";
+    if (strip && sel && matches(sel)) return { nodes };
+    if (Date.now() > deadline) {
+      const why = nodes.some((n) => rl(n) === "dialog")
+        ? "a dialog still covers the page"
+        : !strip
+          ? "the record's panel strip is not on screen (the page had not finished rendering)"
+          : `the panel on screen is "${strip.selected ? cleanLabel(nm(strip.selected)) : "(none)"}"`;
+      return {
+        nodes,
+        refusal:
+          `Open panel: (not ${expect})\n\n` +
+          `[!! PANEL NOT READ: ${why}, not "${expect}". NOTHING was read from it — this is ` +
+          `NOT an empty panel. Read it again.]`,
+      };
+    }
+    await sleep(500);
+    nodes = await fullTree(client);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Paged related lists (sn_case_bundle only).
+ *
+ * A related list shows 20 rows; its footer (a11y: navigation "Pagination"
+ * next to the grid) says "Showing 1-20 of 31" and has "First page" /
+ * "Previous page" / "Next page" / "Last page" buttons and a "20 rows per page"
+ * combobox. Measured live: each "Next page" / "First page" click sends ONE
+ * GraphQL read query (nowRecordListConnectedRelated, offset+limit) and no
+ * mutation. Only those two buttons are used. The rows-per-page combobox is
+ * never touched: page size is a stored list preference.
+ * ------------------------------------------------------------------ */
+const SHOWING_RE = /^Showing (\d+)\s*[-–]\s*(\d+) of (\d+)$/i;
+
+type Pager = {
+  showing: { from: number; to: number; total: number; text: string } | null;
+  next: { id?: number; disabled: boolean } | null;
+  first: { id?: number; disabled: boolean } | null;
+};
+
+/** The paging footer that belongs to the panel's OWN grid. */
+function pagerOf(nodes: AXNode[]): Pager {
+  const none: Pager = { showing: null, next: null, first: null };
+  const { parentOf } = buildMaps(nodes);
+  const grid = nodes.find((n) => ["grid", "table", "treegrid"].includes(rl(n)));
+  const navs = nodes.filter((n) => rl(n) === "navigation" && /^pagination$/i.test(nm(n)));
+  if (!grid || !navs.length) return none;
+  // Climb from the grid until an ancestor also holds a "Pagination" footer.
+  let scope: string | undefined;
+  for (let cur: string | undefined = grid.nodeId, i = 0; cur && i < 25 && !scope; i++) {
+    const c: string = cur;
+    if (navs.some((nv) => hasAncestor(nv, c, parentOf))) scope = c;
+    cur = parentOf.get(c);
+  }
+  if (!scope) return none;
+  const inScope = (n: AXNode) => hasAncestor(n, scope!, parentOf);
+  const sn = nodes.find((n) => rl(n) === "StaticText" && SHOWING_RE.test(nm(n)) && inScope(n));
+  const m = sn ? SHOWING_RE.exec(nm(sn)) : null;
+  const btn = (name: string) => {
+    const b = nodes.find((n) => rl(n) === "button" && nm(n) === name && inScope(n));
+    return b ? { id: b.backendDOMNodeId, disabled: prop(b, "disabled") === true } : null;
+  };
+  return {
+    showing: m && sn ? { from: +m[1], to: +m[2], total: +m[3], text: nm(sn) } : null,
+    next: btn("Next page"),
+    first: btn("First page"),
+  };
+}
+
+type Paging = {
+  rows: string[];
+  /** the tree after the list was put back on page 1 */
+  nodes: AXNode[];
+  pages: number;
+  /** N of the footer's "Showing A-B of N", if there is a footer */
+  total: number | null;
+  /** why paging stopped */
+  stop: string;
+  /** "" when the list is back on page 1 (or never left it) */
+  restored: string;
+};
+
+async function readAllPages(
+  client: CDPSession,
+  nodes: AXNode[],
+  transform: RowTransform | undefined,
+  { maxPages = 15, maxMs = 60000, pageWaitMs = 10000 } = {},
+): Promise<Paging> {
+  const t0 = Date.now();
+  type Snap = { ns: AXNode[]; rows: string[]; pg: Pager };
+  const snapOf = (ns: AXNode[]): Snap => ({ ns, rows: readGridRows(ns, transform), pg: pagerOf(ns) });
+  const snap = async () => snapOf(await fullTree(client));
+  const waitFor = async (ok: (s: Snap) => boolean, from: Snap): Promise<Snap> => {
+    const until = Date.now() + pageWaitMs;
+    let s = from;
+    do {
+      await sleep(150);
+      s = await snap();
+    } while (!ok(s) && Date.now() < until);
+    return s;
+  };
+
+  let cur = snapOf(nodes);
+  let moved = false;
+  // Start on page 1: a list left on another page would skip the newest rows.
+  if (cur.pg.showing && cur.pg.showing.from > 1 && cur.pg.first?.id != null && !cur.pg.first.disabled) {
+    await clickBackend(client, cur.pg.first.id);
+    moved = true;
+    cur = await waitFor((s) => s.pg.showing?.from === 1 && s.rows.length > 0, cur);
+  }
+  const total = cur.pg.showing?.total ?? null;
+  const all = [...cur.rows];
+  let pages = 1;
+  let stop = "";
+  for (;;) {
+    const sh = cur.pg.showing;
+    if (!sh) {
+      stop = "single page (no paging footer)";
+      break;
+    }
+    if (sh.to >= sh.total) {
+      stop = `read up to "${sh.text}"`;
+      break;
+    }
+    const nx = cur.pg.next;
+    if (!nx || nx.id == null) {
+      stop = `no "Next page" button after "${sh.text}"`;
+      break;
+    }
+    if (nx.disabled) {
+      stop = `"Next page" is disabled after "${sh.text}"`;
+      break;
+    }
+    if (pages >= maxPages) {
+      stop = `stopped at the ${maxPages}-page cap`;
+      break;
+    }
+    if (Date.now() - t0 > maxMs) {
+      stop = `stopped at the ${Math.round(maxMs / 1000)}s cap`;
+      break;
+    }
+    const prev = cur;
+    await clickBackend(client, nx.id);
+    moved = true;
+    const s = await waitFor(
+      (x) =>
+        !!x.pg.showing &&
+        x.pg.showing.from === sh.to + 1 &&
+        x.rows.length === x.pg.showing.to - x.pg.showing.from + 1 &&
+        (x.rows[0] ?? "") !== (prev.rows[0] ?? ""),
+      prev,
+    );
+    cur = s;
+    if (!(s.pg.showing && s.pg.showing.from === sh.to + 1 && s.rows.length)) {
+      stop = `the page after "${sh.text}" did not load within ${Math.round(pageWaitMs / 1000)}s`;
+      break;
+    }
+    await sleep(200);
+    all.push(...s.rows);
+    pages++;
+  }
+
+  // Put the list back on page 1, so sn_read_panel and the next read see it as before.
+  let restored = "";
+  if (moved && !(cur.pg.showing?.from === 1)) {
+    const f = cur.pg.first;
+    if (f?.id != null && !f.disabled) {
+      await clickBackend(client, f.id);
+      cur = await waitFor((s) => s.pg.showing?.from === 1 && s.rows.length > 0, cur);
+    }
+    if (!(cur.pg.showing?.from === 1)) restored = "the list could not be put back on page 1";
+  }
+  return { rows: all, nodes: cur.ns, pages, total, stop, restored };
+}
+
 /** Read the currently open panel: its records, or report empty. */
-export async function readPanel(page: Page, transform?: RowTransform): Promise<string> {
+export async function readPanel(
+  page: Page,
+  transform?: RowTransform,
+  opts: ReadPanelOptions = {},
+): Promise<string> {
   const client = await openSession(page);
   try {
-    const nodes = await fullTree(client);
+    let nodes = await fullTree(client);
+    if (opts.expect != null) {
+      const guarded = await guardPanel(page, client, nodes, opts.expect);
+      if (guarded.refusal) return guarded.refusal;
+      nodes = guarded.nodes;
+    }
+    let paging: Paging | null = null;
+    if (opts.allPages) {
+      paging = await readAllPages(client, nodes, transform);
+      nodes = paging.nodes;
+    }
     const { byId, parentOf } = buildMaps(nodes);
     const { selected } = panelStrip(nodes);
     const panelLabel = selected ? cleanLabel(nm(selected)).trim() : "(unknown)";
@@ -1678,7 +2549,7 @@ export async function readPanel(page: Page, transform?: RowTransform): Promise<s
       /,\s*(\d+)\s*$/.exec(panelLabel)?.[1] ?? /\(\s*(\d+)\s*\)\s*$/.exec(panelLabel)?.[1];
     const declaredCount = declared != null ? Number(declared) : null;
 
-    const rows = readGridRows(nodes, transform);
+    const rows = paging ? paging.rows : readGridRows(nodes, transform);
     const main = nodes.find((n) => rl(n) === "main");
     const listRows = nodes
       .filter((n) => rl(n) === "listitem" && (!main || hasAncestor(n, main.nodeId, parentOf)))
@@ -1719,6 +2590,20 @@ export async function readPanel(page: Page, transform?: RowTransform): Promise<s
             `real answer: e.g. an empty "Dispatch Orders" means no part was dispatched.`,
         );
       }
+    } else if (paging) {
+      // Every page was read: only an actual shortfall is reported, in the same
+      // words as below so the bundle's "partial" status still triggers.
+      const expected = Math.max(declaredCount ?? 0, paging.total ?? 0);
+      if (rows.length < expected) {
+        out.push(
+          "",
+          `[note: the tab claims ${expected} row(s) but ${rows.length} rendered — ` +
+            `the rest are unread, not absent. (${paging.pages} page(s) read; ${paging.stop}.)]`,
+        );
+      } else if (paging.pages > 1) {
+        out.push("", `[all ${rows.length} rows read, over ${paging.pages} pages]`);
+      }
+      if (paging.restored) out.push(`[note: ${paging.restored}.]`);
     } else if (declaredCount != null && rows.length && declaredCount !== rows.length) {
       out.push(
         "",

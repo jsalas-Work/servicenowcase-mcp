@@ -30,9 +30,12 @@
  * tool 8 acts when the browser is absent. sn_status starts nothing, opens
  * nothing, and reads no ServiceNow data — it only inspects the local debug port.
  *
- * Tool 10 adds no capability: it runs tools 3-7 in a fixed, server-authored
+ * Tool 10 adds no write capability: it runs tools 3-7 in a fixed, server-authored
  * order (with their re-read rules) so a whole case costs one round-trip instead
- * of ~13. See bundle.ts.
+ * of ~13. To read a case completely it also scrolls the activity stream, pages
+ * through related lists ("Next page" / "First page") and steps back from an SHI
+ * note to its case — view state only, and none of it exposed as a tool. See
+ * bundle.ts.
  *
  * All ten tools are implemented.
  */
@@ -236,27 +239,40 @@ server.registerTool(
   {
     title: "Read a whole case",
     description:
-      "Open a case by number and return EVERYTHING about it in one call: header + Details fields + the full activity stream, then the SLAs, Dispatch Orders, Emails (bodies as plain text) and Special handling notes panels, including each SHI note's body. Every section carries a STATUS (OK / EMPTY / UNREAD / NOT FOUND) — UNREAD is never the same as empty. Re-reads stale or unloaded data automatically and ends back on the case. Takes 1-2 minutes. Prefer this over calling sn_open_case / sn_read_case / sn_open_panel / sn_read_panel / sn_open_record one by one. Read-only; the only thing it types into is the search box, to open the case.",
+      "Open a case by number and return EVERYTHING about it in one call: header + Details fields + every activity post, then the SLAs, Dispatch Orders, Emails (every row, bodies as plain text) and Special handling notes panels, including each SHI note's body. Repeated text is shown once, with a pointer to it. Every section carries a STATUS (OK / EMPTY / UNREAD / NOT FOUND; \"partial\" = read but incomplete) — UNREAD is never the same as empty. Re-reads stale or unloaded data automatically and ends back on the case. Takes about a minute. If the output ends with \"[PART 1 of N\", call again with the same number and part=2 (and so on); later parts come from memory. Prefer this over calling sn_open_case / sn_read_case / sn_open_panel / sn_read_panel / sn_open_record one by one. Read-only; the only thing it types into is the search box, to open the case.",
     inputSchema: {
       number: z
         .string()
         .regex(CONFIG.caseNumberPattern, "Must be a case number like CS1234567")
         .describe("Case number, format CS#######"),
+      part: z
+        .number()
+        .int()
+        .min(1)
+        .max(20)
+        .optional()
+        .describe(
+          "Which part to return (default 1). Only after a previous call ended with \"[PART 1 of N\"; part 1 always reads the case afresh.",
+        ),
     },
   },
-  async ({ number }, extra) =>
+  async ({ number, part }, extra) =>
     guard(async () => {
       const token = extra._meta?.progressToken;
-      return caseBundle(number, async (progress, total, message) => {
-        if (extra.signal.aborted) throw new Error("cancelled by the client");
-        if (token === undefined) return;
-        await extra
-          .sendNotification({
-            method: "notifications/progress",
-            params: { progressToken: token, progress, total, message },
-          })
-          .catch(() => {});
-      });
+      return caseBundle(
+        number,
+        async (progress, total, message) => {
+          if (extra.signal.aborted) throw new Error("cancelled by the client");
+          if (token === undefined) return;
+          await extra
+            .sendNotification({
+              method: "notifications/progress",
+              params: { progressToken: token, progress, total, message },
+            })
+            .catch(() => {});
+        },
+        part ?? 1,
+      );
     }),
 );
 

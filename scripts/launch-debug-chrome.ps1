@@ -135,6 +135,9 @@ $chromeArgs = @(
   # buried behind your editor. Neither flag affects page content or security.
   "--disable-features=CalculateNativeWinOcclusion",
   "--disable-backgrounding-occluded-windows",
+  # The workspace collapses the Details form in a small window (a 640x487
+  # window left 13 fields unreadable). Open the window large enough for it.
+  "--window-size=1400,900",
   "--no-first-run",
   "--no-default-browser-check",
   $StartUrl

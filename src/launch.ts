@@ -186,6 +186,11 @@ function chromeArgs(profile: string, port: number): string[] {
     // These remove that failure mode at the source.
     "--disable-features=CalculateNativeWinOcclusion",
     "--disable-backgrounding-occluded-windows",
+    // The workspace collapses the Details form in a small window (a 640x487
+    // window left 13 fields unreadable). Without this flag a new debug window
+    // opens at Chrome's small default size. The server still enlarges a window
+    // below 1360x660 before reading a case.
+    "--window-size=1400,900",
     "--no-first-run",
     "--no-default-browser-check",
     `https://${CONFIG.serviceNowHost}/now/cwf/agent/home`,
